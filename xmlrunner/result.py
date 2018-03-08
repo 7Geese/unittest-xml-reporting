@@ -1,5 +1,6 @@
 import os
 import sys
+import datetime
 import time
 import traceback
 import six
@@ -18,7 +19,7 @@ _illegal_unichrs = [
     (0x7F, 0x84), (0x86, 0x9F),
     (0xFDD0, 0xFDDF), (0xFFFE, 0xFFFF),
 ]
-if sys.maxunicode >= 0x10000:  # not narrow build 
+if sys.maxunicode >= 0x10000:  # not narrow build
     _illegal_unichrs.extend([
         (0x1FFFE, 0x1FFFF), (0x2FFFE, 0x2FFFF),
         (0x3FFFE, 0x3FFFF), (0x4FFFE, 0x4FFFF),
@@ -92,6 +93,7 @@ class _TestInfo(object):
         self.test_result = test_result
         self.outcome = outcome
         self.elapsed_time = 0
+        self.timestamp = datetime.datetime.min.replace(microsecond=0).isoformat()
         if err:
             if self.outcome != _TestInfo.SKIP:
                 self.test_exception_name = safe_unicode(err[0].__name__)
@@ -122,6 +124,8 @@ class _TestInfo(object):
         """
         self.elapsed_time = \
             self.test_result.stop_time - self.test_result.start_time
+        timestamp = datetime.datetime.fromtimestamp(self.test_result.stop_time)
+        self.timestamp = timestamp.replace(microsecond=0).isoformat()
 
     def get_description(self):
         """
@@ -344,6 +348,10 @@ class _XMLTestResult(_TextTestResult):
         testsuite.setAttribute(
             'time', '%.3f' % sum(map(lambda e: e.elapsed_time, tests))
         )
+        if tests:
+            testsuite.setAttribute(
+                'timestamp', max(map(lambda e: e.timestamp, tests))
+            )
         failures = filter(lambda e: e.outcome == e.FAILURE, tests)
         testsuite.setAttribute('failures', str(len(list(failures))))
 
@@ -399,6 +407,7 @@ class _XMLTestResult(_TextTestResult):
             'name', _XMLTestResult._test_method_name(test_result.test_id)
         )
         testcase.setAttribute('time', '%.3f' % test_result.elapsed_time)
+        testcase.setAttribute('timestamp', test_result.timestamp)
 
         if (test_result.outcome != test_result.SUCCESS):
             elem_name = ('failure', 'error', 'skipped')[test_result.outcome-1]
