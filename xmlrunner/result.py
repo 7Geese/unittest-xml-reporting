@@ -613,7 +613,7 @@ class _XMLTestResult(_TextTestResult):
 
                 self.stream.writeln('Generated XML report: {}'.format(filename))
 
-        if not outputHandledAsString:
+        if all_results and not outputHandledAsString:
             # Assume that test_runner.output is a stream
             test_runner.output.write(xml_content)
 
