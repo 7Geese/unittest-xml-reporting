@@ -2,7 +2,7 @@
 import sys
 import time
 
-from .unittest import TextTestRunner
+from .unittest import TextTestRunner, TestProgram
 from .result import _XMLTestResult
 
 # see issue #74, the encoding name needs to be one of
@@ -14,13 +14,11 @@ class XMLTestRunner(TextTestRunner):
     """
     A test runner class that outputs the results in JUnit like XML files.
     """
-    def __init__(self, output='.', outsuffix=None, stream=sys.stderr,
-                 descriptions=True, verbosity=1, elapsed_times=True,
-                 failfast=False, buffer=False, encoding=UTF8,
-                 resultclass=None):
-        TextTestRunner.__init__(self, stream, descriptions, verbosity,
-                                failfast=failfast, buffer=buffer)
-        self.verbosity = verbosity
+    def __init__(self, output='.', outsuffix=None, 
+                 elapsed_times=True, encoding=UTF8,
+                 resultclass=None,
+                 **kwargs):
+        super(XMLTestRunner, self).__init__(**kwargs)
         self.output = output
         self.encoding = encoding
         # None means default timestamped suffix
@@ -52,6 +50,7 @@ class XMLTestRunner(TextTestRunner):
             # Prepare the test execution
             result = self._make_result()
             result.failfast = self.failfast
+            result.buffer = self.buffer
             if hasattr(test, 'properties'):
                 # junit testsuite properties
                 result.properties = test.properties
@@ -114,3 +113,34 @@ class XMLTestRunner(TextTestRunner):
             pass
 
         return result
+
+
+class XMLTestProgram(TestProgram):
+    output = None
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault('testRunner', XMLTestRunner)
+        super(XMLTestProgram, self).__init__(*args, **kwargs)
+
+    def _initArgParsers(self):
+        super(XMLTestProgram, self)._initArgParsers()
+
+        for parser in (self._main_parser, self._discovery_parser):
+            parser.add_argument('-o', '--output', metavar='DIR',
+                                help='Directory for storing XML reports '
+                                "('.' default)")
+
+    def runTests(self):
+        if self.output is not None:
+            kwargs = dict(verbosity=self.verbosity,
+                          failfast=self.failfast,
+                          buffer=self.buffer,
+                          warnings=self.warnings,
+                          output=self.output)
+
+            if sys.version_info[:2] > (3, 4):
+                kwargs.update(tb_locals=self.tb_locals)
+
+            self.testRunner = self.testRunner(**kwargs)
+
+        super(XMLTestProgram, self).runTests()

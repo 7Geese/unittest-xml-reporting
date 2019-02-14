@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 import datetime
@@ -6,6 +7,7 @@ import traceback
 import six
 import re
 from os import path
+from six.moves import StringIO
 
 from .unittest import TestResult, _TextTestResult, failfast
 
@@ -80,6 +82,46 @@ def testcase_name(test_method):
     return result
 
 
+class _DuplicateWriter(io.TextIOBase):
+    """
+    Duplicate output from the first handle to the second handle
+
+    The second handle is expected to be a StringIO and not to block.
+    """
+
+    def __init__(self, first, second):
+        super(_DuplicateWriter, self).__init__()
+        self._first = first
+        self._second = second
+
+    def flush(self):
+        self._first.flush()
+        self._second.flush()
+
+    def writable(self):
+        return True
+
+    def writelines(self, lines):
+        self._first.writelines(lines)
+        self._second.writelines(lines)
+
+    def write(self, b):
+        if isinstance(self._first, io.TextIOBase):
+            wrote = self._first.write(b)
+
+            if wrote is not None:
+                # expected to always succeed to write
+                self._second.write(b[:wrote])
+
+            return wrote
+        else:
+            # file-like object in Python2
+            # It doesn't return wrote bytes.
+            self._first.write(b)
+            self._second.write(b)
+            return len(b)
+
+
 class _TestInfo(object):
     """
     This class keeps useful information about the execution of a
@@ -113,8 +155,10 @@ class _TestInfo(object):
 
         self.test_name = testcase_name(test_method)
         self.test_id = test_method.id()
+        self.subDescription = None
         if subTest:
             self.test_id = subTest.id()
+            self.subDescription = subTest._subDescription()
 
     def id(self):
         return self.test_id
@@ -131,7 +175,12 @@ class _TestInfo(object):
         """
         Return a text representation of the test method.
         """
-        return self.test_description
+        description = self.test_description
+
+        if self.subDescription is not None:
+            description += ' ' + self.subDescription
+
+        return description
 
     def get_error_info(self):
         """
@@ -150,9 +199,12 @@ class _XMLTestResult(_TextTestResult):
     def __init__(self, stream=sys.stderr, descriptions=1, verbosity=1,
                  elapsed_times=True, properties=None, infoclass=None):
         _TextTestResult.__init__(self, stream, descriptions, verbosity)
-        self.buffer = True  # we are capturing test output
         self._stdout_data = None
         self._stderr_data = None
+        self._stdout_capture = StringIO()
+        self.__stdout_saved = None
+        self._stderr_capture = StringIO()
+        self.__stderr_saved = None
         self.successes = []
         self.callback = None
         self.elapsed_times = elapsed_times
@@ -187,6 +239,9 @@ class _XMLTestResult(_TextTestResult):
                 )
             elif self.dots:
                 self.stream.write(short_str)
+
+            self.stream.flush()
+
         self.callback = callback
 
     def startTest(self, test):
@@ -199,15 +254,37 @@ class _XMLTestResult(_TextTestResult):
         if self.showAll:
             self.stream.write('  ' + self.getDescription(test))
             self.stream.write(" ... ")
+            self.stream.flush()
+
+    def _setupStdout(self):
+        """
+        Capture stdout / stderr by replacing sys.stdout / sys.stderr
+        """
+        super(_XMLTestResult, self)._setupStdout()
+        self.__stdout_saved = sys.stdout
+        sys.stdout = _DuplicateWriter(sys.stdout, self._stdout_capture)
+        self.__stderr_saved = sys.stderr
+        sys.stderr = _DuplicateWriter(sys.stderr, self._stderr_capture)
+
+    def _restoreStdout(self):
+        """
+        Stop capturing stdout / stderr and recover sys.stdout / sys.stderr
+        """
+        if self.__stdout_saved:
+            sys.stdout = self.__stdout_saved
+            self.__stdout_saved = None
+        if self.__stderr_saved:
+            sys.stderr = self.__stderr_saved
+            self.__stderr_saved = None
+        self._stdout_capture.seek(0)
+        self._stdout_capture.truncate()
+        self._stderr_capture.seek(0)
+        self._stderr_capture.truncate()
+        super(_XMLTestResult, self)._restoreStdout()
 
     def _save_output_data(self):
-        # Only try to get sys.stdout and sys.sterr as they not be
-        # StringIO yet, e.g. when test fails during __call__
-        try:
-            self._stdout_data = sys.stdout.getvalue()
-            self._stderr_data = sys.stderr.getvalue()
-        except AttributeError:
-            pass
+        self._stdout_data = self._stdout_capture.getvalue()
+        self._stderr_data = self._stderr_capture.getvalue()
 
     def stopTest(self, test):
         """
@@ -266,14 +343,29 @@ class _XMLTestResult(_TextTestResult):
         Called when a subTest method raises an error.
         """
         if err is not None:
+
+            errorText = None
+            errorValue = None
+            errorList = None
+            if issubclass(err[0], test.failureException):
+                errorText = 'FAIL'
+                errorValue = self.infoclass.FAILURE
+                errorList = self.failures
+
+            else:
+                errorText = 'ERROR'
+                errorValue = self.infoclass.ERROR
+                errorList = self.errors
+
             self._save_output_data()
+
             testinfo = self.infoclass(
-                self, testcase, self.infoclass.ERROR, err, subTest=test)
-            self.errors.append((
+                self, testcase, errorValue, err, subTest=test)
+            errorList.append((
                 testinfo,
                 self._exc_info_to_string(err, testcase)
             ))
-            self._prepare_callback(testinfo, [], 'ERROR', 'E')
+            self._prepare_callback(testinfo, [], errorText, errorText[0])
 
     def addSkip(self, test, reason):
         """
@@ -284,6 +376,36 @@ class _XMLTestResult(_TextTestResult):
             self, test, self.infoclass.SKIP, reason)
         self.skipped.append((testinfo, reason))
         self._prepare_callback(testinfo, [], 'SKIP', 'S')
+
+    def addExpectedFailure(self, test, err):
+        """
+        Missing in xmlrunner, copy-pasted from xmlrunner addError.
+        """
+        self._save_output_data()
+
+        testinfo = self.infoclass(self, test, self.infoclass.ERROR, err)
+        testinfo.test_exception_name = 'ExpectedFailure'
+        testinfo.test_exception_message = 'EXPECTED FAILURE: {}'.format(testinfo.test_exception_message)
+
+        self.expectedFailures.append((testinfo, self._exc_info_to_string(err, test)))
+        self._prepare_callback(testinfo, [], 'EXPECTED FAILURE', 'X')
+
+    @failfast
+    def addUnexpectedSuccess(self, test):
+        """
+        Missing in xmlrunner, copy-pasted from xmlrunner addSuccess.
+        """
+        self._save_output_data()
+
+        testinfo = self.infoclass(self, test)  # do not set outcome here because it will need exception
+        testinfo.outcome = self.infoclass.ERROR
+        # But since we want to have error outcome, we need to provide additional fields:
+        testinfo.test_exception_name = 'UnexpectedSuccess'
+        testinfo.test_exception_message = ('UNEXPECTED SUCCESS: This test was marked as expected failure but passed, '
+                                           'please review it')
+
+        self.unexpectedSuccesses.append(testinfo)
+        self._prepare_callback(testinfo, [], 'UNEXPECTED SUCCESS', 'U')
 
     def printErrorList(self, flavour, errors):
         """
@@ -297,6 +419,7 @@ class _XMLTestResult(_TextTestResult):
             )
             self.stream.writeln(self.separator2)
             self.stream.writeln('%s' % test_info.get_error_info())
+            self.stream.flush()
 
     def _get_info_by_testcase(self):
         """
@@ -488,6 +611,8 @@ class _XMLTestResult(_TextTestResult):
                 with open(filename, 'wb') as report_file:
                     report_file.write(xml_content)
 
+                self.stream.writeln('Generated XML report: {}'.format(filename))
+
         if not outputHandledAsString:
             # Assume that test_runner.output is a stream
             test_runner.output.write(xml_content)
@@ -517,16 +642,8 @@ class _XMLTestResult(_TextTestResult):
             msgLines = traceback.format_exception(exctype, value, tb)
 
         if self.buffer:
-            # Only try to get sys.stdout and sys.sterr as they not be
-            # StringIO yet, e.g. when test fails during __call__
-            try:
-                output = sys.stdout.getvalue()
-            except AttributeError:
-                output = None
-            try:
-                error = sys.stderr.getvalue()
-            except AttributeError:
-                error = None
+            output = self._stdout_capture.getvalue()
+            error = self._stdout_capture.getvalue()
             if output:
                 if not output.endswith('\n'):
                     output += '\n'

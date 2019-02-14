@@ -3,20 +3,30 @@
 
 """Executable module to test unittest-xml-reporting.
 """
+import contextlib
+import io
 import sys
 
 from xmlrunner.unittest import unittest
 import xmlrunner
+from xmlrunner.result import _DuplicateWriter
 from xmlrunner.result import _XMLTestResult
 import doctest
 import tests.doctest_example
 from six import StringIO, BytesIO
 from tempfile import mkdtemp
+from tempfile import mkstemp
 from shutil import rmtree
 from glob import glob
 from xml.dom import minidom
 from lxml import etree
+import os
 import os.path
+
+try:
+    from unittest import mock
+except ImportError:
+    import mock
 
 
 def _load_schema():
@@ -53,6 +63,22 @@ class DoctestTest(unittest.TestCase):
                       'name="threetimes"'.encode('utf8'), output)
         self.assertIn('classname="tests.doctest_example" '
                       'name="twice"'.encode('utf8'), output)
+
+
+@contextlib.contextmanager
+def capture_stdout_stderr():
+    """
+    context manager to capture stdout and stderr
+    """
+    orig_stdout = sys.stdout
+    orig_stderr = sys.stderr
+    sys.stdout = StringIO()
+    sys.stderr = StringIO()
+    try:
+        yield (sys.stdout, sys.stderr)
+    finally:
+        sys.stdout = orig_stdout
+        sys.stderr = orig_stderr
 
 
 class XMLTestRunnerTestCase(unittest.TestCase):
@@ -102,6 +128,9 @@ class XMLTestRunnerTestCase(unittest.TestCase):
             print('should be printed')
             self.fail('expected to fail')
 
+        def test_output(self):
+            print('test message')
+
         def test_non_ascii_runner_buffer_output_fail(self):
             print(u'Where is the café ?')
             self.fail(u'The café could not be found')
@@ -117,6 +146,11 @@ class XMLTestRunnerTestCase(unittest.TestCase):
             for i in range(2):
                 with self.subTest(i=i):
                     self.fail('this is a subtest.')
+
+        def test_subTest_error(self):
+            for i in range(2):
+                with self.subTest(i=i):
+                    raise Exception('this is a subtest')
 
     class DummyErrorInCallTest(unittest.TestCase):
 
@@ -180,12 +214,15 @@ class XMLTestRunnerTestCase(unittest.TestCase):
         runner.run(suite)
         outdir.seek(0)
         output = outdir.read()
-        self.assertIn('classname="tests.testsuite.DummyTest" '
-                      'name="test_pass"'.encode('utf8'),
-                      output)
-        self.assertIn('classname="tests.testsuite.DummySubTest" '
-                      'name="test_subTest_pass"'.encode('utf8'),
-                      output)
+        self.assertRegexpMatches(
+            output,
+            r'classname="tests\.testsuite\.(XMLTestRunnerTestCase\.)?'
+            r'DummyTest" name="test_pass"'.encode('utf8'),
+        )
+        self.assertRegexpMatches(
+            output,
+            r'classname="tests\.testsuite\.(XMLTestRunnerTestCase\.)?'
+            r'DummySubTest" name="test_subTest_pass"'.encode('utf8'))
 
     def test_xmlrunner_non_ascii(self):
         suite = unittest.TestSuite()
@@ -270,7 +307,25 @@ class XMLTestRunnerTestCase(unittest.TestCase):
         runner = xmlrunner.XMLTestRunner(
             stream=self.stream, output=outdir, verbosity=self.verbosity,
             **self.runner_kwargs)
-        runner.run(suite)
+
+        # allow output non-ascii letters to stdout
+        orig_stdout = sys.stdout
+        if getattr(sys.stdout, 'buffer', None):
+            # Python3
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+        else:
+            # Python2
+            import codecs
+            sys.stdout = codecs.getwriter("utf-8")(sys.stdout)
+
+        try:
+            runner.run(suite)
+        finally:
+            if getattr(sys.stdout, 'buffer', None):
+                # Python3
+                # Not to be closed when TextIOWrapper is disposed.
+                sys.stdout.detach()
+            sys.stdout = orig_stdout
         outdir.seek(0)
         output = outdir.read()
         self.assertIn(
@@ -296,9 +351,51 @@ class XMLTestRunnerTestCase(unittest.TestCase):
     def test_xmlrunner_buffer_output_fail(self):
         suite = unittest.TestSuite()
         suite.addTest(self.DummyTest('test_runner_buffer_output_fail'))
+        # --buffer option
+        self.runner_kwargs['buffer'] = True
         self._test_xmlrunner(suite)
         testsuite_output = self.stream.getvalue()
         self.assertIn('should be printed', testsuite_output)
+
+    def test_xmlrunner_output_without_buffer(self):
+        suite = unittest.TestSuite()
+        suite.addTest(self.DummyTest('test_output'))
+        with capture_stdout_stderr() as r:
+            self._test_xmlrunner(suite)
+        output_from_test = r[0].getvalue()
+        self.assertIn('test message', output_from_test)
+
+    def test_xmlrunner_output_with_buffer(self):
+        suite = unittest.TestSuite()
+        suite.addTest(self.DummyTest('test_output'))
+        # --buffer option
+        self.runner_kwargs['buffer'] = True
+        with capture_stdout_stderr() as r:
+            self._test_xmlrunner(suite)
+        output_from_test = r[0].getvalue()
+        self.assertNotIn('test message', output_from_test)
+
+    def test_xmlrunner_stdout_stderr_recovered_without_buffer(self):
+        orig_stdout = sys.stdout
+        orig_stderr = sys.stderr
+        suite = unittest.TestSuite()
+        suite.addTest(self.DummyTest('test_pass'))
+        self._test_xmlrunner(suite)
+        self.assertIs(orig_stdout, sys.stdout)
+        self.assertIs(orig_stderr, sys.stderr)
+
+    def test_xmlrunner_stdout_stderr_recovered_with_buffer(self):
+        orig_stdout = sys.stdout
+        orig_stderr = sys.stderr
+        suite = unittest.TestSuite()
+        suite.addTest(self.DummyTest('test_pass'))
+        # --buffer option
+        self.runner_kwargs['buffer'] = True
+        self._test_xmlrunner(suite)
+        self.assertIs(orig_stdout, sys.stdout)
+        self.assertIs(orig_stderr, sys.stderr)
+        suite = unittest.TestSuite()
+        suite.addTest(self.DummyTest('test_pass'))
 
     @unittest.skipIf(not hasattr(unittest.TestCase, 'subTest'),
                      'unittest.TestCase.subTest not present.')
@@ -313,14 +410,40 @@ class XMLTestRunnerTestCase(unittest.TestCase):
         runner.run(suite)
         outdir.seek(0)
         output = outdir.read()
-        self.assertIn(
-            b'<testcase classname="tests.testsuite.DummySubTest" '
-            b'name="test_subTest_fail (i=0)"',
-            output)
-        self.assertIn(
-            b'<testcase classname="tests.testsuite.DummySubTest" '
-            b'name="test_subTest_fail (i=1)"',
-            output)
+        self.assertRegexpMatches(
+            output,
+            br'<testcase classname="tests\.testsuite\.'
+            br'(XMLTestRunnerTestCase\.)?DummySubTest" '
+            br'name="test_subTest_fail \(i=0\)"')
+        self.assertRegexpMatches(
+            output,
+            br'<testcase classname="tests\.testsuite\.'
+            br'(XMLTestRunnerTestCase\.)?DummySubTest" '
+            br'name="test_subTest_fail \(i=1\)"')
+
+    @unittest.skipIf(not hasattr(unittest.TestCase, 'subTest'),
+                     'unittest.TestCase.subTest not present.')
+    def test_unittest_subTest_error(self):
+        # test for issue #155
+        outdir = BytesIO()
+        runner = xmlrunner.XMLTestRunner(
+            stream=self.stream, output=outdir, verbosity=self.verbosity,
+            **self.runner_kwargs)
+        suite = unittest.TestSuite()
+        suite.addTest(self.DummySubTest('test_subTest_error'))
+        runner.run(suite)
+        outdir.seek(0)
+        output = outdir.read()
+        self.assertRegexpMatches(
+            output,
+            br'<testcase classname="tests\.testsuite\.'
+            br'(XMLTestRunnerTestCase\.)?DummySubTest" '
+            br'name="test_subTest_error \(i=0\)"')
+        self.assertRegexpMatches(
+            output,
+            br'<testcase classname="tests\.testsuite\.'
+            br'(XMLTestRunnerTestCase\.)?DummySubTest" '
+            br'name="test_subTest_error \(i=1\)"')
 
     @unittest.skipIf(not hasattr(unittest.TestCase, 'subTest'),
                      'unittest.TestCase.subTest not present.')
@@ -492,3 +615,145 @@ class XMLTestRunnerTestCase(unittest.TestCase):
         runner = self._test_xmlrunner(suite)
         countAfterTest = sys.getrefcount(self.DummyRefCountTest.dummy)
         self.assertEqual(countBeforeTest, countAfterTest)
+
+    class StderrXMLTestRunner(xmlrunner.XMLTestRunner):
+        """
+        XMLTestRunner that outputs to sys.stderr that might be replaced
+
+        Though XMLTestRunner defaults to use sys.stderr as stream,
+        it cannot be replaced e.g. by replaced by capture_stdout_stderr(),
+        as it's already resolved.
+        This class resolved sys.stderr lazily and outputs to replaced sys.stderr.
+        """
+        def __init__(self, **kwargs):
+            super(XMLTestRunnerTestCase.StderrXMLTestRunner, self).__init__(
+                stream=sys.stderr,
+                **kwargs
+            )
+
+    def test_test_program_succeed_with_buffer(self):
+        with capture_stdout_stderr() as r:
+            unittest.TestProgram(
+                module=self.__class__.__module__,
+                testRunner=self.StderrXMLTestRunner,
+                argv=[
+                    sys.argv[0],
+                    '-b',
+                    'XMLTestRunnerTestCase.DummyTest.test_runner_buffer_output_pass',
+                ],
+                exit=False,
+            )
+        self.assertNotIn('should not be printed', r[0].getvalue())
+        self.assertNotIn('should not be printed', r[1].getvalue())
+
+    def test_test_program_succeed_wo_buffer(self):
+        with capture_stdout_stderr() as r:
+            unittest.TestProgram(
+                module=self.__class__.__module__,
+                testRunner=self.StderrXMLTestRunner,
+                argv=[
+                    sys.argv[0],
+                    'XMLTestRunnerTestCase.DummyTest.test_runner_buffer_output_pass',
+                ],
+                exit=False,
+            )
+        self.assertIn('should not be printed', r[0].getvalue())
+        self.assertNotIn('should not be printed', r[1].getvalue())
+
+    def test_test_program_fail_with_buffer(self):
+        with capture_stdout_stderr() as r:
+            unittest.TestProgram(
+                module=self.__class__.__module__,
+                testRunner=self.StderrXMLTestRunner,
+                argv=[
+                    sys.argv[0],
+                    '-b',
+                    'XMLTestRunnerTestCase.DummyTest.test_runner_buffer_output_fail',
+                ],
+                exit=False,
+            )
+        self.assertNotIn('should be printed', r[0].getvalue())
+        self.assertIn('should be printed', r[1].getvalue())
+
+    def test_test_program_fail_wo_buffer(self):
+        with capture_stdout_stderr() as r:
+            unittest.TestProgram(
+                module=self.__class__.__module__,
+                testRunner=self.StderrXMLTestRunner,
+                argv=[
+                    sys.argv[0],
+                    'XMLTestRunnerTestCase.DummyTest.test_runner_buffer_output_fail',
+                ],
+                exit=False,
+            )
+        self.assertIn('should be printed', r[0].getvalue())
+        self.assertNotIn('should be printed', r[1].getvalue())
+
+
+class DuplicateWriterTestCase(unittest.TestCase):
+    def setUp(self):
+        fd, self.file = mkstemp()
+        self.fh = os.fdopen(fd, 'w')
+        self.buffer = StringIO()
+        self.writer = _DuplicateWriter(self.fh, self.buffer)
+
+    def tearDown(self):
+        self.buffer.close()
+        self.fh.close()
+        os.unlink(self.file)
+
+    def getFirstContent(self):
+        with open(self.file, 'r') as f:
+            return f.read()
+
+    def getSecondContent(self):
+        return self.buffer.getvalue()
+
+    def test_flush(self):
+        self.writer.write('foobarbaz')
+        self.writer.flush()
+        self.assertEqual(self.getFirstContent(), self.getSecondContent())
+
+    def test_writable(self):
+        self.assertTrue(self.writer.writable())
+
+    def test_writelines(self):
+        self.writer.writelines([
+            'foo\n',
+            'bar\n',
+            'baz\n',
+        ])
+        self.writer.flush()
+        self.assertEqual(self.getFirstContent(), self.getSecondContent())
+
+    def test_write(self):
+        # try long buffer (1M)
+        buffer = 'x' * (1024 * 1024)
+        wrote = self.writer.write(buffer)
+        self.writer.flush()
+        self.assertEqual(self.getFirstContent(), self.getSecondContent())
+        self.assertEqual(wrote, len(self.getSecondContent()))
+
+
+@unittest.skipIf(sys.version_info[0] < 3, 'Python 3 required')
+class XMLProgramTestCase(unittest.TestCase):
+    @mock.patch('sys.argv', ['xmlrunner', '-o', 'flaf'])
+    @mock.patch('xmlrunner.runner.XMLTestRunner')
+    @mock.patch('sys.exit')
+    def test_xmlrunner_output(self, exiter, testrunner):
+        xmlrunner.runner.XMLTestProgram()
+
+        kwargs = dict(
+            buffer=False,
+            failfast=False,
+            verbosity=1,
+            warnings='default',
+            output='flaf',
+        )
+
+        if sys.version_info[:2] > (3, 4):
+            kwargs.update(tb_locals=False)
+
+        testrunner.assert_called_once_with(**kwargs)
+
+        exiter.assert_called_once_with(False)
